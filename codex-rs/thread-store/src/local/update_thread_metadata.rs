@@ -14,6 +14,7 @@ use codex_rollout::find_archived_thread_path_by_id_str;
 use codex_rollout::find_thread_path_by_id_str;
 use codex_rollout::read_session_meta_line;
 use codex_state::ThreadMetadataBuilder;
+use codex_state::truncate_thread_metadata_text;
 use tracing::warn;
 
 use super::LocalThreadStore;
@@ -39,7 +40,8 @@ pub(super) async fn update_thread_metadata(
     params: UpdateThreadMetadataParams,
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
-    let patch = params.patch;
+    let mut patch = params.patch;
+    truncate_metadata_patch(&mut patch);
     if patch.is_empty() {
         return read_thread::read_thread(
             store,
@@ -368,6 +370,25 @@ async fn apply_metadata_update(
         },
     )
     .await
+}
+
+fn truncate_metadata_patch(patch: &mut ThreadMetadataPatch) {
+    if let Some(Some(name)) = patch.name.as_mut() {
+        truncate_metadata_patch_string(name);
+    }
+    if let Some(preview) = patch.preview.as_mut() {
+        truncate_metadata_patch_string(preview);
+    }
+    if let Some(title) = patch.title.as_mut() {
+        truncate_metadata_patch_string(title);
+    }
+    if let Some(first_user_message) = patch.first_user_message.as_mut() {
+        truncate_metadata_patch_string(first_user_message);
+    }
+}
+
+fn truncate_metadata_patch_string(value: &mut String) {
+    *value = truncate_thread_metadata_text(value.as_str());
 }
 
 fn needs_rollout_compatibility_update(patch: &ThreadMetadataPatch) -> bool {
@@ -1363,6 +1384,95 @@ mod tests {
         assert_eq!(
             metadata.first_user_message.as_deref(),
             Some("Later first message")
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_patch_caps_direct_text_fields_in_sqlite() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = LocalThreadStore::new(config, Some(runtime.clone()));
+        let uuid = Uuid::from_u128(314);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        write_session_file(home.path(), "2025-01-03T19-15-00", uuid).expect("session file");
+        let long_text = "x".repeat(codex_state::THREAD_METADATA_TEXT_MAX_CHARS + 1);
+
+        store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    preview: Some(long_text.clone()),
+                    title: Some(long_text.clone()),
+                    first_user_message: Some(long_text.clone()),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect("set capped observed metadata");
+
+        let metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("sqlite metadata read")
+            .expect("sqlite metadata");
+        assert_eq!(
+            metadata.title.chars().count(),
+            codex_state::THREAD_METADATA_TEXT_MAX_CHARS
+        );
+        assert_eq!(
+            metadata
+                .preview
+                .as_deref()
+                .expect("preview")
+                .chars()
+                .count(),
+            codex_state::THREAD_METADATA_TEXT_MAX_CHARS
+        );
+        assert_eq!(
+            metadata
+                .first_user_message
+                .as_deref()
+                .expect("first user message")
+                .chars()
+                .count(),
+            codex_state::THREAD_METADATA_TEXT_MAX_CHARS
+        );
+
+        store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    name: Some(Some(long_text)),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect("set capped name metadata");
+
+        let latest_name = codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
+            .await
+            .expect("find thread name")
+            .expect("thread name");
+        assert_eq!(
+            latest_name.chars().count(),
+            codex_state::THREAD_METADATA_TEXT_MAX_CHARS
+        );
+        let metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("sqlite metadata read")
+            .expect("sqlite metadata");
+        assert_eq!(
+            metadata.title.chars().count(),
+            codex_state::THREAD_METADATA_TEXT_MAX_CHARS
         );
     }
 

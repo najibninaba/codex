@@ -13,6 +13,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_state::truncate_thread_metadata_text;
 
 use crate::CreateThreadParams;
 use crate::GitInfoPatch;
@@ -257,7 +258,7 @@ impl ThreadMetadataSync {
                         let title = strip_user_message_prefix(user.message.as_str());
                         if !title.is_empty() {
                             self.title_seen = true;
-                            update.title = Some(title.to_string());
+                            update.title = Some(truncate_thread_metadata_text(title));
                         }
                     }
                 }
@@ -271,7 +272,7 @@ impl ThreadMetadataSync {
                         let objective = event.goal.objective.trim();
                         if !objective.is_empty() {
                             self.preview_seen = true;
-                            update.preview = Some(objective.to_string());
+                            update.preview = Some(truncate_thread_metadata_text(objective));
                         }
                     }
                 }
@@ -325,7 +326,7 @@ fn strip_user_message_prefix(text: &str) -> &str {
 fn user_message_preview(user: &UserMessageEvent) -> Option<String> {
     let message = strip_user_message_prefix(user.message.as_str());
     if !message.is_empty() {
-        return Some(message.to_string());
+        return Some(truncate_thread_metadata_text(message));
     }
     if user
         .images
@@ -427,6 +428,50 @@ mod tests {
 
         sync.mark_pending_update_applied(&update);
         assert!(sync.take_pending_update().is_none());
+    }
+
+    #[test]
+    fn resume_history_caps_message_derived_metadata() {
+        let thread_id = ThreadId::new();
+        let message = "x".repeat(codex_state::THREAD_METADATA_TEXT_MAX_CHARS + 1);
+        let sync = ThreadMetadataSync::for_resume(&resume_params(
+            thread_id,
+            vec![RolloutItem::EventMsg(EventMsg::UserMessage(user_message(
+                message.as_str(),
+            )))],
+        ));
+
+        let update = sync.take_pending_update().expect("pending metadata update");
+        assert_eq!(
+            update
+                .patch
+                .preview
+                .as_deref()
+                .expect("preview")
+                .chars()
+                .count(),
+            codex_state::THREAD_METADATA_TEXT_MAX_CHARS
+        );
+        assert_eq!(
+            update
+                .patch
+                .title
+                .as_deref()
+                .expect("title")
+                .chars()
+                .count(),
+            codex_state::THREAD_METADATA_TEXT_MAX_CHARS
+        );
+        assert_eq!(
+            update
+                .patch
+                .first_user_message
+                .as_deref()
+                .expect("first user message")
+                .chars()
+                .count(),
+            codex_state::THREAD_METADATA_TEXT_MAX_CHARS
+        );
     }
 
     #[test]

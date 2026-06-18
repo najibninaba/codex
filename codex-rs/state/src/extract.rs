@@ -10,6 +10,16 @@ use serde::Serialize;
 use serde_json::Value;
 
 const IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER: &str = "[Image]";
+/// Maximum number of Unicode scalar values stored in discovery metadata text.
+pub const THREAD_METADATA_TEXT_MAX_CHARS: usize = 4096;
+
+/// Bound text copied into thread metadata while preserving valid UTF-8.
+pub fn truncate_thread_metadata_text(text: &str) -> String {
+    match text.char_indices().nth(THREAD_METADATA_TEXT_MAX_CHARS) {
+        Some((idx, _)) => text[..idx].to_string(),
+        None => text.to_string(),
+    }
+}
 
 /// Apply a rollout item to the metadata structure.
 pub fn apply_rollout_item(
@@ -99,7 +109,7 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
             if metadata.title.is_empty() {
                 let title = strip_user_message_prefix(user.message.as_str());
                 if !title.is_empty() {
-                    metadata.title = title.to_string();
+                    metadata.title = truncate_thread_metadata_text(title);
                 }
             }
         }
@@ -117,7 +127,7 @@ fn apply_response_item(_metadata: &mut ThreadMetadata, _item: &ResponseItem) {}
 
 fn set_preview_if_empty(metadata: &mut ThreadMetadata, preview: Option<String>) {
     if metadata.preview.is_none() {
-        metadata.preview = preview;
+        metadata.preview = preview.map(|preview| truncate_thread_metadata_text(preview.as_str()));
     }
 }
 
@@ -131,7 +141,7 @@ fn strip_user_message_prefix(text: &str) -> &str {
 fn user_message_preview(user: &UserMessageEvent) -> Option<String> {
     let message = strip_user_message_prefix(user.message.as_str());
     if !message.is_empty() {
-        return Some(message.to_string());
+        return Some(truncate_thread_metadata_text(message));
     }
     if user
         .images
@@ -154,6 +164,7 @@ pub(crate) fn enum_to_string<T: Serialize>(value: &T) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::THREAD_METADATA_TEXT_MAX_CHARS;
     use super::apply_rollout_item;
     use crate::model::ThreadMetadata;
     use chrono::DateTime;
@@ -221,6 +232,70 @@ mod tests {
         );
         assert_eq!(metadata.preview.as_deref(), Some("actual user request"));
         assert_eq!(metadata.title, "actual user request");
+    }
+
+    #[test]
+    fn event_msg_user_message_caps_metadata_text_fields() {
+        let mut metadata = metadata_for_test();
+        let message = "x".repeat(THREAD_METADATA_TEXT_MAX_CHARS + 1);
+        let item = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            client_id: None,
+            message: format!("{USER_MESSAGE_BEGIN}{message}"),
+            images: Some(vec![]),
+            local_images: vec![],
+            text_elements: vec![],
+            ..Default::default()
+        }));
+
+        apply_rollout_item(&mut metadata, &item, "test-provider");
+
+        assert_eq!(
+            metadata
+                .first_user_message
+                .as_deref()
+                .expect("first user message")
+                .chars()
+                .count(),
+            THREAD_METADATA_TEXT_MAX_CHARS
+        );
+        assert_eq!(
+            metadata
+                .preview
+                .as_deref()
+                .expect("preview")
+                .chars()
+                .count(),
+            THREAD_METADATA_TEXT_MAX_CHARS
+        );
+        assert_eq!(
+            metadata.title.chars().count(),
+            THREAD_METADATA_TEXT_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn event_msg_user_message_metadata_limit_is_utf8_safe() {
+        let mut metadata = metadata_for_test();
+        let wide_char = char::from_u32(0x1F680).expect("valid unicode scalar");
+        let message: String = (0..=THREAD_METADATA_TEXT_MAX_CHARS)
+            .map(|_| wide_char)
+            .collect();
+        let item = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            client_id: None,
+            message,
+            images: Some(vec![]),
+            local_images: vec![],
+            text_elements: vec![],
+            ..Default::default()
+        }));
+
+        apply_rollout_item(&mut metadata, &item, "test-provider");
+
+        assert_eq!(
+            metadata.title.chars().count(),
+            THREAD_METADATA_TEXT_MAX_CHARS
+        );
+        assert!(metadata.title.chars().all(|ch| ch == wide_char));
     }
 
     #[test]
@@ -309,6 +384,39 @@ mod tests {
             Some("next normal prompt")
         );
         assert_eq!(metadata.title, "next normal prompt");
+    }
+
+    #[test]
+    fn event_msg_thread_goal_caps_preview() {
+        let mut metadata = metadata_for_test();
+        let objective = "x".repeat(THREAD_METADATA_TEXT_MAX_CHARS + 1);
+        let goal_item =
+            RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                thread_id: metadata.id,
+                turn_id: None,
+                goal: ThreadGoal {
+                    thread_id: metadata.id,
+                    objective,
+                    status: ThreadGoalStatus::Active,
+                    token_budget: None,
+                    tokens_used: 0,
+                    time_used_seconds: 0,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            }));
+
+        apply_rollout_item(&mut metadata, &goal_item, "test-provider");
+
+        assert_eq!(
+            metadata
+                .preview
+                .as_deref()
+                .expect("preview")
+                .chars()
+                .count(),
+            THREAD_METADATA_TEXT_MAX_CHARS
+        );
     }
 
     #[test]
